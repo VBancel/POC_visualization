@@ -7,7 +7,6 @@
 
 
 
-
 #plotOutput et 
 library(shiny)
 library(bslib)
@@ -17,8 +16,10 @@ library(dplyr)
 library(ggplot2)
 library(tools)
 library(lubridate)
-
-
+source("plot_functions.R")
+library(leaflet)
+library(leaflet.extras)
+library(sf)
 
 # Define UI for application that draws a histogram
 ui <- dashboardPage(
@@ -30,7 +31,7 @@ ui <- dashboardPage(
     dashboardSidebar(
       sidebarMenu(
         menuItem("Plot of variables", tabName = "plot_variable"),
-        menuItem("Dowload data", tabName = "download_data")
+        menuItem("Download data", tabName = "download_data")
       )),
       
     dashboardBody(
@@ -41,49 +42,78 @@ ui <- dashboardPage(
                  box(selectInput("selected_var",
                                  "Variable x",
                                  choice = c("latitude", "longitude", "profondeur" = "depth", "année" = "timestamp"),
-                                 selected = "latitude"),
-                     conditionalPanel(
-                       condition = "input.selected_var != 'timestamp'",
-                       sliderInput("bins",
-                                     "Largeurs tranches",
-                                     min = 10,
-                                     max = 50,
-                                     step = 10,
-                                     value = 10)),
-                       conditionalPanel(
-                         condition = "input.selected_var == 'timestamp'",
-                         selectInput("date_var",
-                                     "Variable de temps",
-                                     choices = c("year", "month"),
-                                     selected = "year")))))
-        )
-      )
+                                 selected = "latitude"), 
+                     uiOutput("dynamic_input"))
+               ) 
+        ), # end of Plot variables
+        
+        tabItem(tabName = "download_data",
+                fluidRow(
+                  box(leafletOutput("map"), height = 500),
+                  box(h3("Entrer les coordonées du rectangle :"),
+                      numericInput("N", "Lat. max", value = 40),
+                      numericInput("S", "Lat. min", value = -40),
+                      numericInput("O", "Long. min", value = -40),
+                      numericInput("E", "Long. max", value = 40),
+                      hr(),
+                      h3("Or trace rectangle on the map")),
+                  box(
+                    actionButton("download_selected", "Download data in the selected area"),
+                    downloadButton("downloadData", "Download data"))
+                  
+                  )
+                ) # end of Download data
+        
+            )
+        ) # end of the body
 )
+
+
+
+
 
 # Define server logic 
 
 server <- function(input, output, session) {
   
-  # load flux carbon
+  ###---- load data flux carbone ------
+  
   db_carbon <- read.csv("~/complex/flux_carbone/my_code/Results/Global_Poc_Database_Cathryn.csv")
+  db_carbon$timestamp <- as.POSIXct(db_carbon$timestamp, format="%Y-%m-%d %H:%M:%S", tz="UTC")
   
-  #si la variable selectionnee est depth ou ..., on change la selection des bins
   
-  observeEvent(input$selected_var, {
+  
+  ###---- plot variable window -------
+  
+  
+  # modif of 2nd choice according to first variable
+  
+  output$dynamic_input <- renderUI({
     if (input$selected_var == "depth"){
-      updateSliderInput(session, "bins", min = 100, max = 1000, value = 500, step = 100)
+      sliderInput("bins", "Largeurs tranches", min = 100, max = 1000, value = 500, step = 100)
+    }
+    else if (input$selected_var %in% c("latitude", "longitude")) {
+      sliderInput("bins", "Largeurs tranches", min = 10, max = 50, value = 10, step = 10)      
+    }
+    else if (input$selected_var %in% c("timestamp")){
+      selectInput("date_var",
+                  "Variable de temps",
+                  choices = c("year", "month"),
+                  selected = "year")
     }
   })
   
   
+  ###----- creation du plot -----
+  
   output$histogram <- renderPlot({
-    
-    if (input$selected_var == "") return(NULL)
     
     if (!(input$selected_var %in% names(db_carbon))) {
       showNotification(paste("Erreur : La colonne", input$selected_var, "n'existe pas dans les données"), type = "error")
       return(NULL)
     }
+    
+    # seq of x axis depending on bins and variable we want to represent
     
     if (input$selected_var == "latitude") {
       bin_range <- seq(-90, 90, by = input$bins)  # Latitude ranges from -90 to 90
@@ -95,7 +125,8 @@ server <- function(input, output, session) {
       bin_range <- seq(0, 6000, by = input$bins)
     }
         
-    ###---- if we want to show a variable cut by bins
+    ###---- if we want to show a variable cut by bins ==> cut data and count them by bins -----
+    
     if (input$selected_var %in% c("latitude", "longitude", "depth")){
       db_carbon <- db_carbon %>%
         mutate(var_bins = cut(db_carbon[[input$selected_var]], 
@@ -120,28 +151,12 @@ server <- function(input, output, session) {
       # Calculer les limites des bins pour les étiquettes
       count_data$bin_labels <- paste0("(", bin_range[-length(bin_range)], ", ", bin_range[-1], "]")
       
-      
-      plot <- ggplot(count_data, aes(x = var_bins, y = count, fill = count)) +
-        geom_bar(stat = "identity", color = "white", show.legend = FALSE) +
-        scale_fill_gradient(low = "lightblue", high = "darkblue") +  # Palette de couleurs plus esthétique
-        labs(
-          title = paste0("Nombre de mesures par tranche de ", input$selected_var),
-          subtitle = "Distribution des mesures POC en fonction de la latitude",
-          x = toTitleCase(input$selected_var), 
-          y = "Nombre de mesures"
-        ) +
-        scale_x_discrete(labels = function(x) gsub("\\[|\\)", "", x)) +
-        theme_minimal() +  # Utilisation d'un thème minimaliste
-        theme(
-          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 12),
-          axis.text.y = element_text(size = 12),
-          axis.title.x = element_text(size = 14),
-          axis.title.y = element_text(size = 14),
-          plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
-          plot.subtitle = element_text(hjust = 0.5, size = 12)
-        )
+      # create the plot
+      plot <- plot_lat_lon_depth(count_data, input$selected_var)
+
     }
     
+  ###--- if we want to show by year/month : just count nbr measure by year/month ----
     
     if (input$selected_var %in% c("timestamp")){
 
@@ -149,36 +164,78 @@ server <- function(input, output, session) {
       db_carbon <- db_carbon %>%  mutate(date_value = case_when(
         input$date_var == "year" ~ year(timestamp),
         input$date_var == "month" ~month(timestamp)))
+      
       count_data <- db_carbon %>%
         group_by(date_value) %>%
         summarise(count = n())
       
-      # create ggplot
-      
-      plot <- ggplot(count_data, aes(x = date_value, y = count, fill = count)) +
-        geom_bar(stat = "identity", color = "white", show.legend = FALSE) +
-        scale_fill_gradient(low = "lightblue", high = "darkblue") +  # Palette de couleurs plus esthétique
-        labs(
-          title = paste0("Nombre de mesures en fonction de ", input$date_var),
-          x = toTitleCase(input$date_var), 
-          y = "Nombre de mesures"
-        ) +
-        theme_minimal() +  # Utilisation d'un thème minimaliste
-        theme(
-          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 12),
-          axis.text.y = element_text(size = 12),
-          axis.title.x = element_text(size = 14),
-          axis.title.y = element_text(size = 14),
-          plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
-          plot.subtitle = element_text(hjust = 0.5, size = 12)
-        )
+      # create the plot
+      plot <- plot_other(count_data, input$date_var)
       
     }
     
     return(plot)
-      
-      
+    })
+  
+  
+  ### ----- plot map to choose area -----
+  
+  
+  #initialize map
+  
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addTiles() %>%
+      setView(lng = 0, lat = 20, zoom = 2) %>%
+      addDrawToolbar(
+        targetGroup = 'drawItems',
+        rectangleOptions = drawRectangleOptions(),
+        polylineOptions = FALSE,  # Désactiver certaines options
+        polygonOptions = FALSE,   
+        circleOptions = FALSE,
+        markerOptions = FALSE,
+        circleMarkerOptions = FALSE,
+        editOptions = editToolbarOptions(edit = TRUE, remove = TRUE)
+        
+        # polyline = FALSE,
+        # polygon = FALSE,
+        # rectangle = TRUE,
+        # circle = FALSE,
+        # marker = FALSE,
+        # editOptions = editToolbarOptions(selectedPathOptions = selectedPathOptions())
+        ) %>% 
+      addLayersControl(
+        overlayGroups = c("drawItems"),
+        options = layersControlOptions(collapsed = FALSE)
+      )
   })
+  
+  
+  # if user draw rectangle
+  
+  observeEvent(input$map_draw_new_feature, {
+    feature <- input$map_draw_new_feature
+    if (feature$properties$feature_type == "rectangle") {
+      lat1 <- feature$geometry$coordinates[[1]][[2]][2]  # Coin supérieur gauche
+      lon1 <- feature$geometry$coordinates[[1]][[1]][1]  # Coin supérieur gauche
+      lat2 <- feature$geometry$coordinates[[1]][[4]][2]  # Coin inférieur droit
+      lon2 <- feature$geometry$coordinates[[1]][[2]][1]  # Coin inférieur droit
+      print(paste("Rectangle tracé :", lat1, lon1, lat2, lon2))
+    }
+  })
+  
+  
+  ###--- modify data to download based on choice of user---- 
+  
+  output$dowloadData <- downloadHandler(
+    filename = function(){
+      paste0(input$dataset, ".csv")},
+    content= function(file){
+      write.csv()
+    }
+  )
+  
+  
     
 }
 
